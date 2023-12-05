@@ -23,6 +23,12 @@ Make sure you have Rust and Cargo installed on your system. If not, you can inst
     cd Weezy
     ```
 
+3. Start a matchbox server:
+
+    ```bash
+    matchbox_server
+    ```
+
 3. Run the game using Cargo:
 
     ```bash
