@@ -1,6 +1,7 @@
 use bevy::{
     prelude::*, render::camera::ScalingMode, tasks::IoTaskPool, transform::commands, utils::HashMap,
 };
+use bevy_asset_loader::prelude::*;
 use bevy_ggrs::*;
 use bevy_matchbox::{matchbox_socket::*, MatchboxSocket};
 use components::*;
@@ -14,11 +15,25 @@ const GRID_WIDTH: f32 = 0.05;
 
 type Config = bevy_ggrs::GgrsConfig<u8, PeerId>;
 
+#[derive(AssetCollection, Resource)]
+struct ImageAssets {
+    #[asset(path = "bullet.png")]
+    bullet: Handle<Image>,
+}
+
+#[derive(States, Clone, Eq, PartialEq, Debug, Hash, Default)]
+enum GameState {
+    #[default]
+    AssetLoading,
+    Matchmaking,
+    InGame,
+}
+
 fn setup(mut commands: Commands) {
     let mut camera_bundle = Camera2dBundle::default();
     camera_bundle.projection.scaling_mode = ScalingMode::FixedVertical(10.);
     commands.spawn(camera_bundle);
-    
+
     // Horizontal lines
     for i in 0..=MAP_SIZE {
         commands.spawn(SpriteBundle {
@@ -54,11 +69,14 @@ fn setup(mut commands: Commands) {
     }
 }
 
-fn spawn_player(mut commands: Commands) {
+fn spawn_players(mut commands: Commands) {
+    // Player 1
     // Player 1
     commands
         .spawn((
             Player { handle: 0 },
+            BulletReady(true),
+            MoveDir(-Vec2::X),
             SpriteBundle {
                 transform: Transform::from_translation(Vec3::new(-2., 0., 100.)),
                 sprite: Sprite {
@@ -75,6 +93,8 @@ fn spawn_player(mut commands: Commands) {
     commands
         .spawn((
             Player { handle: 1 },
+            BulletReady(true),
+            MoveDir(Vec2::X),
             SpriteBundle {
                 transform: Transform::from_translation(Vec3::new(2., 0., 100.)),
                 sprite: Sprite {
@@ -88,12 +108,33 @@ fn spawn_player(mut commands: Commands) {
         .add_rollback();
 }
 
+const PLAYER_RADIUS: f32 = 0.5;
+const BULLET_RADIUS: f32 = 0.025;
+
+fn kill_players(
+    mut commands: Commands,
+    players: Query<(Entity, &Transform), (With<Player>, Without<Bullet>)>,
+    bullets: Query<&Transform, With<Bullet>>,
+) {
+    for (player, player_transform) in &players {
+        for bullet_transform in &bullets {
+            let distance = Vec2::distance(
+                player_transform.translation.xy(),
+                bullet_transform.translation.xy(),
+            );
+            if distance < PLAYER_RADIUS + BULLET_RADIUS {
+                commands.entity(player).despawn_recursive();
+            }
+        }
+    }
+}
+
 fn move_players(
-    mut players: Query<(&mut Transform, &Player)>,
+    mut players: Query<(&mut Transform, &mut MoveDir, &Player)>,
     inputs: Res<PlayerInputs<Config>>,
     time: Res<Time>,
 ) {
-    for (mut transform, player) in &mut players {
+    for (mut transform, mut move_dir, player) in &mut players {
         let (input, _) = inputs[player.handle];
 
         let direction = direction(input);
@@ -101,6 +142,8 @@ fn move_players(
         if direction == Vec2::ZERO {
             continue;
         }
+
+        move_dir.0 = direction;
 
         let move_speed = 7.;
         let move_delta = direction * move_speed * time.delta_seconds();
@@ -120,7 +163,11 @@ fn start_matchbox_socket(mut commands: Commands) {
     commands.insert_resource(MatchboxSocket::new_ggrs(room_url));
 }
 
-fn wait_for_players(mut commands: Commands, mut socket: ResMut<MatchboxSocket<SingleChannel>>) {
+fn wait_for_players(
+    mut commands: Commands,
+    mut socket: ResMut<MatchboxSocket<SingleChannel>>,
+    mut next_state: ResMut<NextState<GameState>>,
+) {
     if socket.get_channel(0).is_err() {
         return;
     }
@@ -150,6 +197,7 @@ fn wait_for_players(mut commands: Commands, mut socket: ResMut<MatchboxSocket<Si
         .expect("failed to start session");
 
     commands.insert_resource(bevy_ggrs::Session::P2P(ggrs_session));
+    next_state.set(GameState::InGame);
 }
 
 fn camera_follow(
@@ -171,9 +219,65 @@ fn camera_follow(
         }
     }
 }
+fn fire_bullets(
+    mut commands: Commands,
+    inputs: Res<PlayerInputs<Config>>,
+    images: Res<ImageAssets>,
+    mut players: Query<(&Transform, &Player, &mut BulletReady, &MoveDir)>,
+) {
+    for (transform, player, mut bullet_ready, move_dir) in &mut players {
+        let (input, _) = inputs[player.handle];
+        if fire(input) && bullet_ready.0 {
+            let player_pos = transform.translation.xy(); // <-- new
+            let pos = player_pos + move_dir.0 * PLAYER_RADIUS + BULLET_RADIUS; // <-- new
+            commands
+                .spawn((
+                    Bullet,
+                    *move_dir,
+                    SpriteBundle {
+                        transform: Transform::from_translation(pos.extend(200.)) // <-- new
+                            .with_rotation(Quat::from_rotation_arc_2d(Vec2::X, move_dir.0)),
+                        texture: images.bullet.clone(),
+                        sprite: Sprite {
+                            custom_size: Some(Vec2::new(0.3, 0.1)),
+                            ..default()
+                        },
+                        ..default()
+                    },
+                ))
+                .add_rollback();
+            bullet_ready.0 = false;
+        }
+    }
+}
+
+fn reload_bullet(
+    inputs: Res<PlayerInputs<Config>>,
+    mut players: Query<(&mut BulletReady, &Player)>,
+) {
+    for (mut can_fire, player) in players.iter_mut() {
+        let (input, _) = inputs[player.handle];
+        if !fire(input) {
+            can_fire.0 = true;
+        }
+    }
+}
+
+fn move_bullet(mut bullets: Query<(&mut Transform, &MoveDir), With<Bullet>>, time: Res<Time>) {
+    for (mut transform, dir) in &mut bullets {
+        let speed = 20.;
+        let delta = dir.0 * speed * time.delta_seconds();
+        transform.translation += delta.extend(0.);
+    }
+}
 
 fn main() {
     App::new()
+        .add_state::<GameState>()
+        .add_loading_state(
+            LoadingState::new(GameState::AssetLoading).continue_to_state(GameState::Matchmaking),
+        )
+        .add_collection_to_loading_state::<_, ImageAssets>(GameState::AssetLoading)
         .add_plugins((
             DefaultPlugins.set(WindowPlugin {
                 primary_window: Some(Window {
@@ -185,11 +289,34 @@ fn main() {
             }),
             GgrsPlugin::<Config>::default(),
         ))
+        .rollback_component_with_copy::<BulletReady>()
         .rollback_component_with_clone::<Transform>()
+        .rollback_component_with_copy::<MoveDir>()
         .insert_resource(ClearColor(Color::rgb(0.53, 0.53, 0.53)))
-        .add_systems(Startup, (setup, spawn_player, start_matchbox_socket))
-        .add_systems(Update, (wait_for_players, camera_follow)) // CHANGED
-        .add_systems(ReadInputs, read_local_inputs) // NEW
-        .add_systems(GgrsSchedule, move_players) // NEW
+        .add_systems(
+            OnEnter(GameState::Matchmaking),
+            (setup, start_matchbox_socket),
+        )
+        .add_systems(OnEnter(GameState::InGame), spawn_players)
+        .add_systems(
+            Update,
+            (
+                wait_for_players.run_if(in_state(GameState::Matchmaking)),
+                camera_follow.run_if(in_state(GameState::InGame)),
+            ),
+        )
+        .add_systems(ReadInputs, read_local_inputs)
+        .add_systems(
+            GgrsSchedule,
+            (
+                move_players,
+                reload_bullet,
+                fire_bullets.after(move_players).after(reload_bullet),
+                move_bullet.after(fire_bullets),
+                kill_players.after(move_bullet).after(move_players), // <-- new
+            )
+                .run_if(in_state(GameState::InGame))
+                .after(apply_state_transition::<GameState>),
+        )
         .run();
 }
