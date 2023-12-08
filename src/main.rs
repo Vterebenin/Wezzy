@@ -2,7 +2,7 @@ use std::hash::{BuildHasher, Hash};
 
 use args::Args;
 use bevy::{
-    prelude::*, render::camera::ScalingMode, tasks::IoTaskPool, transform::commands, utils::{HashMap, FixedState},
+    prelude::*, render::camera::ScalingMode, utils::FixedState,
 };
 use bevy_asset_loader::prelude::*;
 use bevy_ggrs::{*, ggrs::DesyncDetection, prelude::GgrsEvent};
@@ -11,6 +11,11 @@ use components::*;
 use inputs::*;
 use clap::Parser;
 use std::hash::Hasher;
+use bevy_roll_safe::prelude::*;
+use bevy_egui::{
+    egui::{self, Align2, Color32, FontId, RichText},
+    EguiContexts, EguiPlugin,
+};
 
 mod args;
 mod components;
@@ -75,9 +80,21 @@ fn setup(mut commands: Commands) {
     }
 }
 
-fn spawn_players(mut commands: Commands) {
-    // Player 1
-    // Player 1
+fn spawn_players(
+    mut commands: Commands, 
+    players: Query<Entity, With<Player>>,
+    bullets: Query<Entity, With<Bullet>>,
+) {
+    info!("Spawning players");
+
+    for player in &players {
+        commands.entity(player).despawn_recursive();
+    }
+
+    for bullet in &bullets {
+        commands.entity(bullet).despawn_recursive();
+    }
+
     commands
         .spawn((
             Player { handle: 0 },
@@ -119,17 +136,27 @@ const BULLET_RADIUS: f32 = 0.025;
 
 fn kill_players(
     mut commands: Commands,
-    players: Query<(Entity, &Transform), (With<Player>, Without<Bullet>)>,
+    players: Query<(Entity, &Transform, &Player), Without<Bullet>>,
     bullets: Query<&Transform, With<Bullet>>,
+    mut next_state: ResMut<NextState<RollbackState>>,
+    mut scores: ResMut<Scores>, 
 ) {
-    for (player, player_transform) in &players {
+    for (player_entity, player_transform, player) in &players {
         for bullet_transform in &bullets {
             let distance = Vec2::distance(
                 player_transform.translation.xy(),
                 bullet_transform.translation.xy(),
             );
             if distance < PLAYER_RADIUS + BULLET_RADIUS {
-                commands.entity(player).despawn_recursive();
+                commands.entity(player_entity).despawn_recursive();
+                next_state.set(RollbackState::RoundEnd); // new
+
+                if player.handle == 0 {
+                    scores.1 += 1;
+                } else {
+                    scores.0 += 1;
+                }
+                info!("player died: {scores:?}")
             }
         }
     }
@@ -353,11 +380,40 @@ fn handle_ggrs_events(mut session: ResMut<Session<Config>>) {
     }
 }
 
+fn round_end_timeout(
+    mut timer: ResMut<RoundEndTimer>,
+    mut state: ResMut<NextState<RollbackState>>,
+    time: Res<Time>,
+) {
+    timer.tick(time.delta());
+
+    if timer.just_finished() {
+        state.set(RollbackState::InRound);
+    }
+}
+
+fn update_score_ui(mut contexts: EguiContexts, scores: Res<Scores>) {
+    let Scores(p1_score, p2_score) = *scores;
+
+    egui::Area::new("score")
+        .anchor(Align2::CENTER_TOP, (0., 25.))
+        .show(contexts.ctx_mut(), |ui| {
+            ui.label(
+                RichText::new(format!("{p1_score} - {p2_score}"))
+                    .color(Color32::BLACK)
+                    .font(FontId::proportional(72.0)),
+            );
+        });
+}
+
+
 fn main() {
     let args = Args::parse();
     eprintln!("{args:?}");
     App::new()
         .insert_resource(args)
+        .init_resource::<RoundEndTimer>()
+        .init_resource::<Scores>()
         .add_state::<GameState>()
         .add_loading_state(
             LoadingState::new(GameState::AssetLoading).continue_to_state(GameState::Matchmaking),
@@ -366,14 +422,15 @@ fn main() {
         .add_plugins((
             DefaultPlugins.set(WindowPlugin {
                 primary_window: Some(Window {
-                    // fill the entire browser window
                     fit_canvas_to_parent: true,
                     ..default()
                 }),
                 ..default()
             }),
             GgrsPlugin::<Config>::default(),
+            EguiPlugin,
         ))
+        .add_roll_state::<RollbackState>(GgrsSchedule)
         .rollback_component_with_clone::<Sprite>()
         .rollback_component_with_clone::<GlobalTransform>()
         .rollback_component_with_clone::<Handle<Image>>()
@@ -384,8 +441,11 @@ fn main() {
         .rollback_component_with_clone::<Transform>()
         .rollback_component_with_copy::<MoveDir>()
         .rollback_component_with_copy::<Player>()
-        .checksum_component::<Transform>(checksum_transform) // new
+        .rollback_resource_with_clone::<RoundEndTimer>()
+        .rollback_resource_with_copy::<Scores>() // NEW
+        .checksum_component::<Transform>(checksum_transform) 
         .insert_resource(ClearColor(Color::rgb(0.53, 0.53, 0.53)))
+        .add_systems(OnEnter(RollbackState::InRound), spawn_players) 
         .add_systems(
             OnEnter(GameState::Matchmaking),
             (setup, start_matchbox_socket.run_if(p2p_mode)),
@@ -398,11 +458,18 @@ fn main() {
                     start_synctest_session.run_if(synctest_mode),
                 )
                     .run_if(in_state(GameState::Matchmaking)),
-                (camera_follow, handle_ggrs_events).run_if(in_state(GameState::InGame)), // changed
+                (camera_follow, update_score_ui, handle_ggrs_events).run_if(in_state(GameState::InGame)),
             ),
         )
         .add_systems(OnEnter(GameState::InGame), spawn_players)
         .add_systems(ReadInputs, read_local_inputs)
+        .add_systems(
+            GgrsSchedule,
+            round_end_timeout
+                .ambiguous_with(kill_players) // new
+                .run_if(in_state(RollbackState::RoundEnd))
+                .after(apply_state_transition::<RollbackState>),
+        )
         .add_systems(
             GgrsSchedule,
             (
@@ -412,8 +479,8 @@ fn main() {
                 move_bullet.after(fire_bullets),
                 kill_players.after(move_bullet).after(move_players), // <-- new
             )
-                .run_if(in_state(GameState::InGame))
-                .after(apply_state_transition::<GameState>),
+                .after(apply_state_transition::<RollbackState>) // NEW
+                .run_if(in_state(RollbackState::InRound)),
         )
         .run();
 }

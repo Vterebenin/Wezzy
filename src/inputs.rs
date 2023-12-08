@@ -43,10 +43,7 @@ pub fn read_local_inputs(
 pub fn direction(input: u8) -> Vec2 {
     let mut direction = Vec2::ZERO;
     if input & INPUT_UP != 0 {
-        direction.y += 1.;
-    }
-    if input & INPUT_DOWN != 0 {
-        direction.y -= 1.;
+        direction.y += 10.;
     }
     if input & INPUT_RIGHT != 0 {
         direction.x += 1.;
@@ -54,6 +51,7 @@ pub fn direction(input: u8) -> Vec2 {
     if input & INPUT_LEFT != 0 {
         direction.x -= 1.;
     }
+    direction.y -= 0.3;
     direction.normalize_or_zero()
 }
 

@@ -10,4 +10,6 @@ bevy = { version = "0.12.1", features = ["wayland"] }
 bevy_ggrs = { version = "0.14", features = ["wasm-bindgen"] }
 bevy_matchbox = { version = "0.8", features = ["ggrs"] }
 clap = { version = "4.4", features = ["derive"] }
+bevy_roll_safe = "0.1"
 bevy_asset_loader = "0.18"
+bevy_egui = "0.23"
